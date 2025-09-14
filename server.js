@@ -165,6 +165,8 @@ async function sendUtmifyOrder({
     products: [{
       id: transactionId,
       name: "Doação",
+      planId: "doacao_unica",     // ✅ NOVO: obrigatório p/ UTMify
+      planName: "Doação Única",   // ✅ NOVO: obrigatório p/ UTMify
       quantity: 1,
       priceInCents: amountInCents,
     }],
