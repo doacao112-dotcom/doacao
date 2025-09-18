@@ -16,11 +16,12 @@ function getClientIp(req) {
   const xf = req.headers['x-forwarded-for'];
   return (typeof xf === 'string' && xf.split(',')[0].trim()) || req.socket?.remoteAddress || '0.0.0.0';
 }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* =========================
    CALLBACK fixo (hardcoded)
 ========================= */
-// >>> edite aqui se mudar seu domínio <<<
+// >>> edite se mudar seu domínio <<<
 const HARDCODED_CALLBACK = 'https://doacaopeluda.up.railway.app/webhooks/veopag';
 
 function normalizeCallbackUrl(raw) {
@@ -31,7 +32,7 @@ function normalizeCallbackUrl(raw) {
   if (!/\/webhooks\/veopag$/i.test(url)) url += '/webhooks/veopag';
   return url;
 }
-// Prioriza o hardcoded; se quiser manter ENV como fallback, troque a ordem
+// prioriza o hardcoded; (se quiser, use process.env.PUBLIC_CALLBACK_URL como fallback)
 const CALLBACK_URL = normalizeCallbackUrl(HARDCODED_CALLBACK) || normalizeCallbackUrl(process.env.PUBLIC_CALLBACK_URL);
 if (!CALLBACK_URL) throw new Error('Callback URL inválida');
 
@@ -40,7 +41,7 @@ if (!CALLBACK_URL) throw new Error('Callback URL inválida');
 ========================= */
 const app = express();
 
-// CORS bem permissivo por env (ou “*”)
+// CORS simples e seguro (env: CORS_ORIGINS="https://seusite.com,https://*.netlify.app" ou "*")
 const allowed = (process.env.CORS_ORIGINS || '*')
   .split(',')
   .map(s => s.trim().replace(/\/$/, ''))
@@ -96,7 +97,7 @@ async function veopagToken() {
   return data.token;
 }
 
-// Parser flexível (pega EMV/QR em qualquer formato e por regex)
+// Parser flexível (pega EMV em vários campos; cai pra regex se precisar)
 function parseVeopagDepositResponse(data) {
   const qrBlock = data?.qrCodeResponse || data?.qr_code_response || data?.qr || data?.data || data;
   const transactionId =
@@ -108,7 +109,8 @@ function parseVeopagDepositResponse(data) {
 
   let copyPaste =
     qrBlock?.pixCopyPaste || qrBlock?.copyPaste || qrBlock?.emv || qrBlock?.payload ||
-    qrBlock?.pixCode || qrBlock?.brCode || (typeof qrBlock?.qrcode === 'string' ? qrBlock.qrcode : null) ||
+    qrBlock?.pixCode || qrBlock?.brCode ||
+    (typeof qrBlock?.qrcode === 'string' ? qrBlock.qrcode : null) ||
     (typeof qrBlock?.code === 'string' ? qrBlock.code : null);
 
   if (!copyPaste) {
@@ -123,34 +125,53 @@ function parseVeopagDepositResponse(data) {
   return { transactionId, qrCodeUrl, copyPaste, expiresAt };
 }
 
+// >>> createDeposit com RETRY (3 tentativas)
 async function createDeposit({ amount, externalId }) {
   const token = await veopagToken();
   const payload = {
     amount,
     external_id: externalId,
-    clientCallbackUrl: CALLBACK_URL, // <<< usa callback fixo
+    clientCallbackUrl: CALLBACK_URL,
     payer: { name: 'Doação Anônima', email: 'anon@exemplo.com', document: '00000000000' }
   };
-  const r = await fetch(VEOPAG_DEPOSIT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify(payload),
-  });
-  const raw = await r.text();
-  if (process.env.DEBUG_VEOPAG === '1') {
-    console.log('[Veopag][deposit][REQ]', JSON.stringify(payload));
-    console.log('[Veopag][deposit][RAW]', r.status, raw);
+
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const r = await fetch(VEOPAG_DEPOSIT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const raw = await r.text();
+    if (process.env.DEBUG_VEOPAG === '1') {
+      console.log(`[Veopag][deposit][TRY ${attempt}]`, r.status, raw);
+    }
+
+    if (r.ok) {
+      const data = JSON.parse(raw);
+      const parsed = parseVeopagDepositResponse(data);
+      if (!parsed.transactionId || (!parsed.qrCodeUrl && !parsed.copyPaste)) {
+        throw new Error(`Resposta Veopag sem EMV/QR: ${raw}`);
+      }
+      return parsed;
+    }
+
+    lastErr = new Error(`Veopag deposit ${r.status}: ${raw}`);
+    if (r.status >= 500 && attempt < 3) {
+      await sleep(attempt * 1000); // 1s, 2s
+      continue;
+    }
+    break;
   }
-  if (!r.ok) throw new Error(`Veopag deposit ${r.status}: ${raw}`);
-  const data = JSON.parse(raw);
-  const parsed = parseVeopagDepositResponse(data);
-  if (!parsed.transactionId || (!parsed.qrCodeUrl && !parsed.copyPaste)) {
-    throw new Error(`Resposta Veopag sem EMV/QR: ${JSON.stringify(data)}`);
-  }
-  return parsed;
+  throw lastErr;
 }
 
-// Fallback para /sync: tenta vários endpoints de status
+// Fallback p/ /sync: tenta variações de endpoint de status
 async function getDepositStatusFallback(transactionId) {
   const token = await veopagToken();
   const urls = [
@@ -397,7 +418,18 @@ app.post('/donations/:id/sync', async (req, res) => {
 });
 
 /* =========================
-   Start
+   Start + sinais (opcional)
 ========================= */
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`API up on :${PORT}`));
+const server = app.listen(PORT, () => console.log(`API up on :${PORT}`));
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM recebido, encerrando...');
+  server.close(() => process.exit(0));
+});
+process.on('SIGINT', () => {
+  console.log('SIGINT recebido, encerrando...');
+  server.close(() => process.exit(0));
+});
+process.on('unhandledRejection', err => console.error('Unhandled rejection:', err));
+process.on('uncaughtException', err => console.error('Uncaught exception:', err));
